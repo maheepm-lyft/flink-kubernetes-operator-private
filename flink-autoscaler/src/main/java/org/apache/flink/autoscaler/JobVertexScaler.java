@@ -34,11 +34,15 @@ import lombok.Getter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.SortedMap;
@@ -46,16 +50,20 @@ import java.util.SortedMap;
 import static org.apache.flink.autoscaler.JobVertexScaler.KeyGroupOrPartitionsAdjustMode.MAXIMIZE_UTILISATION;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.MAX_SCALE_DOWN_FACTOR;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.MAX_SCALE_UP_FACTOR;
+import static org.apache.flink.autoscaler.config.AutoScalerOptions.OBSERVED_SCALABILITY_ENABLED;
+import static org.apache.flink.autoscaler.config.AutoScalerOptions.OBSERVED_SCALABILITY_MIN_OBSERVATIONS;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.SCALE_DOWN_INTERVAL;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.SCALING_EVENT_INTERVAL;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.SCALING_KEY_GROUP_PARTITIONS_ADJUST_MODE;
-import static org.apache.flink.autoscaler.config.AutoScalerOptions.TARGET_UTILIZATION;
+import static org.apache.flink.autoscaler.config.AutoScalerOptions.UTILIZATION_TARGET;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.VERTEX_MAX_PARALLELISM;
 import static org.apache.flink.autoscaler.config.AutoScalerOptions.VERTEX_MIN_PARALLELISM;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.EXPECTED_PROCESSING_RATE;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.MAX_PARALLELISM;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.NUM_SOURCE_PARTITIONS;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.PARALLELISM;
+import static org.apache.flink.autoscaler.metrics.ScalingMetric.SCALE_DOWN_RATE_THRESHOLD;
+import static org.apache.flink.autoscaler.metrics.ScalingMetric.SCALE_UP_RATE_THRESHOLD;
 import static org.apache.flink.autoscaler.metrics.ScalingMetric.TRUE_PROCESSING_RATE;
 import static org.apache.flink.autoscaler.topology.ShipStrategy.HASH;
 import static org.apache.flink.configuration.description.TextElement.text;
@@ -92,12 +100,15 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
     @Getter
     public static class ParallelismChange {
 
-        private static final ParallelismChange NO_CHANGE = new ParallelismChange(-1);
+        private static final ParallelismChange NO_CHANGE = new ParallelismChange(-1, false);
 
         private final int newParallelism;
 
-        private ParallelismChange(int newParallelism) {
+        private final boolean outsideUtilizationBound;
+
+        private ParallelismChange(int newParallelism, boolean outsideUtilizationBound) {
             this.newParallelism = newParallelism;
+            this.outsideUtilizationBound = outsideUtilizationBound;
         }
 
         public boolean isNoChange() {
@@ -113,24 +124,29 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
                 return false;
             }
             ParallelismChange that = (ParallelismChange) o;
-            return newParallelism == that.newParallelism;
+            return newParallelism == that.newParallelism
+                    && outsideUtilizationBound == that.outsideUtilizationBound;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(newParallelism);
+            return Objects.hash(newParallelism, outsideUtilizationBound);
         }
 
         @Override
         public String toString() {
             return isNoChange()
                     ? "NoParallelismChange"
-                    : "ParallelismChange{newParallelism=" + newParallelism + '}';
+                    : "ParallelismChange{newParallelism="
+                            + newParallelism
+                            + ", outsideUtilizationBound="
+                            + outsideUtilizationBound
+                            + "}";
         }
 
-        public static ParallelismChange build(int newParallelism) {
+        public static ParallelismChange build(int newParallelism, boolean outsideUtilizationBound) {
             checkArgument(newParallelism > 0, "The parallelism should be greater than 0.");
-            return new ParallelismChange(newParallelism);
+            return new ParallelismChange(newParallelism, outsideUtilizationBound);
         }
 
         public static ParallelismChange noChange() {
@@ -158,7 +174,7 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
 
         double targetCapacity =
                 AutoScalerUtils.getTargetProcessingCapacity(
-                        evaluatedMetrics, conf, conf.get(TARGET_UTILIZATION), true, restartTime);
+                        evaluatedMetrics, conf, conf.get(UTILIZATION_TARGET), true, restartTime);
         if (Double.isNaN(targetCapacity)) {
             LOG.warn(
                     "Target data rate is not available for {}, cannot compute new parallelism",
@@ -168,6 +184,13 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
 
         LOG.debug("Target processing capacity for {} is {}", vertex, targetCapacity);
         double scaleFactor = targetCapacity / averageTrueProcessingRate;
+        if (conf.get(OBSERVED_SCALABILITY_ENABLED)) {
+
+            double scalingCoefficient =
+                    JobVertexScaler.calculateObservedScalingCoefficient(history, conf);
+
+            scaleFactor = scaleFactor / scalingCoefficient;
+        }
         double minScaleFactor = 1 - conf.get(MAX_SCALE_DOWN_FACTOR);
         double maxScaleFactor = 1 + conf.get(MAX_SCALE_UP_FACTOR);
         if (scaleFactor < minScaleFactor) {
@@ -226,6 +249,83 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
                 delayedScaleDown);
     }
 
+    /**
+     * Calculates the scaling coefficient based on historical scaling data.
+     *
+     * <p>The scaling coefficient is computed using the least squares approach. If there are not
+     * enough observations, or if the computed coefficient is invalid, a default value of {@code
+     * 1.0} is returned, assuming linear scaling.
+     *
+     * @param history A {@code SortedMap} of {@code Instant} timestamps to {@code ScalingSummary}
+     * @param conf Deployment configuration.
+     * @return The computed scaling coefficient.
+     */
+    @VisibleForTesting
+    protected static double calculateObservedScalingCoefficient(
+            SortedMap<Instant, ScalingSummary> history, Configuration conf) {
+        /*
+         * The scaling coefficient is computed using the least squares approach
+         * to fit a linear model:
+         *
+         *      R_i = β * P_i * α
+         *
+         * where:
+         * - R_i = observed processing rate
+         * - P_i = parallelism
+         * - β   = baseline processing rate
+         * - α   = scaling coefficient to optimize
+         *
+         * The optimization minimizes the **sum of squared errors**:
+         *
+         *      Loss = ∑ (R_i - β * α * P_i)^2
+         *
+         * Differentiating w.r.t. α and solving for α:
+         *
+         *      α = ∑ (P_i * R_i) / (∑ (P_i^2) * β)
+         *
+         * We keep the system conservative for higher returns scenario by clamping computed α to an upper bound of 1.0.
+         */
+
+        var minObservations = conf.get(OBSERVED_SCALABILITY_MIN_OBSERVATIONS);
+
+        // not enough data to compute scaling coefficient; we assume linear scaling.
+        if (history.isEmpty() || history.size() < minObservations) {
+            return 1.0;
+        }
+
+        var baselineProcessingRate = AutoScalerUtils.computeBaselineProcessingRate(history);
+
+        if (Double.isNaN(baselineProcessingRate)) {
+            return 1.0;
+        }
+
+        List<Double> parallelismList = new ArrayList<>();
+        List<Double> processingRateList = new ArrayList<>();
+
+        for (Map.Entry<Instant, ScalingSummary> entry : history.entrySet()) {
+            ScalingSummary summary = entry.getValue();
+            double parallelism = summary.getCurrentParallelism();
+            double processingRate = summary.getMetrics().get(TRUE_PROCESSING_RATE).getAverage();
+
+            if (Double.isNaN(processingRate)) {
+                LOG.warn(
+                        "True processing rate is not available in scaling history. Cannot compute scaling coefficient.");
+                return 1.0;
+            }
+
+            parallelismList.add(parallelism);
+            processingRateList.add(processingRate);
+        }
+
+        double lowerBound = conf.get(AutoScalerOptions.OBSERVED_SCALABILITY_COEFFICIENT_MIN);
+
+        var coefficient =
+                AutoScalerUtils.optimizeLinearScalingCoefficient(
+                        parallelismList, processingRateList, baselineProcessingRate, 1, lowerBound);
+
+        return BigDecimal.valueOf(coefficient).setScale(2, RoundingMode.CEILING).doubleValue();
+    }
+
     private ParallelismChange detectBlockScaling(
             Context context,
             JobVertexID vertex,
@@ -239,6 +339,8 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
                 currentParallelism != newParallelism,
                 "The newParallelism is equal to currentParallelism, no scaling is needed. This is probably a bug.");
 
+        var outsideUtilizationBound = outsideUtilizationBound(vertex, evaluatedMetrics);
+
         var scaledUp = currentParallelism < newParallelism;
 
         if (scaledUp) {
@@ -248,7 +350,7 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
 
             // If we don't have past scaling actions for this vertex, don't block scale up.
             if (history.isEmpty()) {
-                return ParallelismChange.build(newParallelism);
+                return ParallelismChange.build(newParallelism, outsideUtilizationBound);
             }
 
             var lastSummary = history.get(history.lastKey());
@@ -260,28 +362,59 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
                 return ParallelismChange.noChange();
             }
 
-            return ParallelismChange.build(newParallelism);
+            return ParallelismChange.build(newParallelism, outsideUtilizationBound);
         } else {
-            return applyScaleDownInterval(delayedScaleDown, vertex, conf, newParallelism);
+            return applyScaleDownInterval(
+                    delayedScaleDown, vertex, conf, newParallelism, outsideUtilizationBound);
         }
+    }
+
+    private static boolean outsideUtilizationBound(
+            JobVertexID vertex, Map<ScalingMetric, EvaluatedScalingMetric> metrics) {
+        double trueProcessingRate = metrics.get(TRUE_PROCESSING_RATE).getAverage();
+        double scaleUpRateThreshold = metrics.get(SCALE_UP_RATE_THRESHOLD).getCurrent();
+        double scaleDownRateThreshold = metrics.get(SCALE_DOWN_RATE_THRESHOLD).getCurrent();
+
+        if (trueProcessingRate < scaleUpRateThreshold
+                || trueProcessingRate > scaleDownRateThreshold) {
+            LOG.debug(
+                    "Vertex {} processing rate {} is outside ({}, {})",
+                    vertex,
+                    trueProcessingRate,
+                    scaleUpRateThreshold,
+                    scaleDownRateThreshold);
+            return true;
+        } else {
+            LOG.debug(
+                    "Vertex {} processing rate {} is within target ({}, {})",
+                    vertex,
+                    trueProcessingRate,
+                    scaleUpRateThreshold,
+                    scaleDownRateThreshold);
+        }
+        return false;
     }
 
     private ParallelismChange applyScaleDownInterval(
             DelayedScaleDown delayedScaleDown,
             JobVertexID vertex,
             Configuration conf,
-            int newParallelism) {
+            int newParallelism,
+            boolean outsideUtilizationBound) {
         var scaleDownInterval = conf.get(SCALE_DOWN_INTERVAL);
         if (scaleDownInterval.toMillis() <= 0) {
             // The scale down interval is disable, so don't block scaling.
-            return ParallelismChange.build(newParallelism);
+            return ParallelismChange.build(newParallelism, outsideUtilizationBound);
         }
 
         var now = clock.instant();
-        var delayedScaleDownInfo = delayedScaleDown.triggerScaleDown(vertex, now, newParallelism);
+        var windowStartTime = now.minus(scaleDownInterval);
+        var delayedScaleDownInfo =
+                delayedScaleDown.triggerScaleDown(
+                        vertex, now, newParallelism, outsideUtilizationBound);
 
         // Never scale down within scale down interval
-        if (now.isBefore(delayedScaleDownInfo.getFirstTriggerTime().plus(scaleDownInterval))) {
+        if (windowStartTime.isBefore(delayedScaleDownInfo.getFirstTriggerTime())) {
             if (now.equals(delayedScaleDownInfo.getFirstTriggerTime())) {
                 LOG.info("The scale down of {} is delayed by {}.", vertex, scaleDownInterval);
             } else {
@@ -293,7 +426,11 @@ public class JobVertexScaler<KEY, Context extends JobAutoScalerContext<KEY>> {
         } else {
             // Using the maximum parallelism within the scale down interval window instead of the
             // latest parallelism when scaling down
-            return ParallelismChange.build(delayedScaleDownInfo.getMaxRecommendedParallelism());
+            var maxRecommendedParallelism =
+                    delayedScaleDownInfo.getMaxRecommendedParallelism(windowStartTime);
+            return ParallelismChange.build(
+                    maxRecommendedParallelism.getParallelism(),
+                    maxRecommendedParallelism.isOutsideUtilizationBound());
         }
     }
 

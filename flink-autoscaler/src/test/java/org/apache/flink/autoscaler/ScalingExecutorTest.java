@@ -50,7 +50,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -120,101 +119,120 @@ public class ScalingExecutorTest {
     }
 
     @Test
-    public void testUtilizationBoundariesForAllRequiredVertices() throws Exception {
+    public void testUtilizationBoundaries() {
         // Restart time should not affect utilization boundary
         var conf = context.getConfiguration();
         conf.set(AutoScalerOptions.RESTART_TIME, Duration.ZERO);
         conf.set(AutoScalerOptions.CATCH_UP_DURATION, Duration.ZERO);
+        conf.set(AutoScalerOptions.SCALE_DOWN_INTERVAL, Duration.ZERO);
 
-        var op1 = new JobVertexID();
+        var sourceHexString = "0bfd135746ac8efb3cce668b12e16d3a";
+        var source = JobVertexID.fromHexString(sourceHexString);
+        var sinkHexString = "a6b7102b8d3e3a9564998c1ffeb5e2b7";
+        var sink = JobVertexID.fromHexString(sinkHexString);
+        var jobTopology =
+                new JobTopology(
+                        new VertexInfo(source, Map.of(), 10, 1000, false, null),
+                        new VertexInfo(sink, Map.of(source, HASH), 10, 1000, false, null));
 
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION, 0.6);
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 0.);
+        // 0.7 is outside of the utilization bound [0.6 - 0.0, 0.6 + 0.0], so scaling happens
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 0.6);
+        conf.set(AutoScalerOptions.UTILIZATION_MAX, 0.6);
+        conf.set(AutoScalerOptions.UTILIZATION_MIN, 0.6);
+        var metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 70, 100), sink, evaluated(10, 60, 100)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .hasSize(1);
 
-        var evaluated = Map.of(op1, evaluated(1, 70, 100));
-        assertFalse(
-                ScalingExecutor.allChangedVerticesWithinUtilizationTarget(
-                        evaluated, evaluated.keySet()));
+        // Both of 0.7 and 0.6 are within the utilization bound [0.6 - 0.2, 0.6 + 0.2], so scaling
+        // could be ignored.
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 0.6);
+        conf.set(AutoScalerOptions.UTILIZATION_MAX, 0.8);
+        conf.set(AutoScalerOptions.UTILIZATION_MIN, 0.4);
+        metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 70, 100), sink, evaluated(10, 60, 100)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .isEmpty();
 
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 0.2);
-        evaluated = Map.of(op1, evaluated(1, 70, 100));
-        assertTrue(
-                ScalingExecutor.allChangedVerticesWithinUtilizationTarget(
-                        evaluated, evaluated.keySet()));
-        assertTrue(getScaledParallelism(stateStore, context).isEmpty());
+        // 0.85 is outside of the utilization bound [0.6 - 0.2, 0.6 + 0.2], so scaling happens
+        metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 70, 100), sink, evaluated(10, 85, 100)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .hasSize(2);
 
-        var op2 = new JobVertexID();
-        evaluated =
-                Map.of(
-                        op1, evaluated(1, 70, 100),
-                        op2, evaluated(1, 85, 100));
-
-        assertFalse(
-                ScalingExecutor.allChangedVerticesWithinUtilizationTarget(
-                        evaluated, evaluated.keySet()));
-
-        evaluated =
-                Map.of(
-                        op1, evaluated(1, 70, 100),
-                        op2, evaluated(1, 70, 100));
-        assertTrue(
-                ScalingExecutor.allChangedVerticesWithinUtilizationTarget(
-                        evaluated, evaluated.keySet()));
+        // Both of 0.7 are within the utilization bound [0.6 - 0.2, 0.6 + 0.2], so scaling could be
+        // ignored.
+        metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 70, 100), sink, evaluated(10, 70, 100)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .isEmpty();
 
         // Test with backlog based scaling
-        evaluated = Map.of(op1, evaluated(1, 70, 100, 15));
-        assertFalse(
-                ScalingExecutor.allChangedVerticesWithinUtilizationTarget(
-                        evaluated, evaluated.keySet()));
-    }
-
-    @Test
-    public void testUtilizationBoundariesWithOptionalVertex() {
-        // Restart time should not affect utilization boundary
-        var conf = context.getConfiguration();
-        conf.set(AutoScalerOptions.RESTART_TIME, Duration.ZERO);
-        conf.set(AutoScalerOptions.CATCH_UP_DURATION, Duration.ZERO);
-        var op1 = new JobVertexID();
-        var op2 = new JobVertexID();
-
-        // All vertices are optional
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION, 0.6);
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 0.);
-
-        var evaluated =
-                Map.of(
-                        op1, evaluated(1, 70, 100),
-                        op2, evaluated(1, 85, 100));
-
-        assertTrue(ScalingExecutor.allChangedVerticesWithinUtilizationTarget(evaluated, Set.of()));
-
-        // One vertex is required, and it's out of range.
-        assertFalse(
-                ScalingExecutor.allChangedVerticesWithinUtilizationTarget(evaluated, Set.of(op1)));
-
-        // One vertex is required, and it's within the range.
-        // The op2 is optional, so it shouldn't affect the scaling even if it is out of range,
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 0.1);
-        evaluated =
-                Map.of(
-                        op1, evaluated(1, 65, 100),
-                        op2, evaluated(1, 85, 100));
-        assertTrue(
-                ScalingExecutor.allChangedVerticesWithinUtilizationTarget(evaluated, Set.of(op1)));
+        metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 70, 100, 15), sink, evaluated(10, 70, 100)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .hasSize(2);
     }
 
     @Test
     public void testNoScaleDownOnZeroLowerUtilizationBoundary() throws Exception {
         var conf = context.getConfiguration();
-        // Target utilization and boundary are identical
+        // Utilization min max is set from 0 to 1
         // which will set the scale down boundary to infinity
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION, 0.6);
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 0.6);
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 0.6);
+        conf.set(AutoScalerOptions.UTILIZATION_MAX, 1.2);
+        conf.set(AutoScalerOptions.UTILIZATION_MIN, 0.);
 
         var vertex = new JobVertexID();
         int parallelism = 100;
         int expectedParallelism = 1;
         int targetRate = 1000;
+
         // Intentionally also set the true processing rate to infinity
         // to test the boundaries of the scaling condition.
         double trueProcessingRate = Double.POSITIVE_INFINITY;
@@ -223,10 +241,6 @@ public class ScalingExecutorTest {
                 new EvaluatedMetrics(
                         Map.of(vertex, evaluated(parallelism, targetRate, trueProcessingRate)),
                         dummyGlobalMetrics);
-
-        assertTrue(
-                ScalingExecutor.allChangedVerticesWithinUtilizationTarget(
-                        evaluated.getVertexMetrics(), evaluated.getVertexMetrics().keySet()));
 
         // Execute the full scaling path
         var now = Instant.now();
@@ -250,6 +264,149 @@ public class ScalingExecutorTest {
     }
 
     @Test
+    public void testUtilizationBoundariesAndUtilizationMinMaxCompatibility() {
+        var conf = context.getConfiguration();
+        conf.set(AutoScalerOptions.RESTART_TIME, Duration.ZERO);
+        conf.set(AutoScalerOptions.CATCH_UP_DURATION, Duration.ZERO);
+        conf.set(AutoScalerOptions.SCALE_DOWN_INTERVAL, Duration.ZERO);
+
+        var source = new JobVertexID();
+        var sink = new JobVertexID();
+        var jobTopology =
+                new JobTopology(
+                        new VertexInfo(source, Map.of(), 10, 1000, false, null),
+                        new VertexInfo(sink, Map.of(source, HASH), 10, 1000, false, null));
+
+        // target 0.6, target boundary 0.1 -> max 0.7, min 0.5
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 0.6);
+        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 0.1);
+
+        var metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 70, 100), sink, evaluated(10, 85, 100)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .containsOnlyKeys(source, sink);
+
+        // target 0.6, max 0.7, min 0.5
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 0.6);
+        conf.removeConfig(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY);
+        conf.set(AutoScalerOptions.UTILIZATION_MAX, 0.7);
+        conf.set(AutoScalerOptions.UTILIZATION_MIN, 0.5);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .containsOnlyKeys(source, sink);
+
+        // When the target boundary parameter is used,
+        // but the min max parameter is also set,
+        // the min max parameter shall prevail.
+        // target 0.6, max 0.7, min 0.3
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 0.6);
+        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 1.);
+        conf.set(AutoScalerOptions.UTILIZATION_MAX, 0.7);
+        conf.set(AutoScalerOptions.UTILIZATION_MIN, 0.3);
+        metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 60, 100), sink, evaluated(10, 85, 100)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .containsOnlyKeys(sink);
+
+        // When the target boundary parameter and max parameter are set,
+        // we expect the min is derived from boundary.
+        // target 0.5, max 0.6, min 0
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 0.5);
+        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 1.);
+        conf.set(AutoScalerOptions.UTILIZATION_MAX, 0.6);
+        conf.removeConfig(AutoScalerOptions.UTILIZATION_MIN);
+
+        metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 100, 99999), sink, evaluated(10, 80, 99999)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .isEmpty();
+
+        metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 50, 100), sink, evaluated(10, 85, 100)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .containsOnlyKeys(sink);
+
+        // When the target boundary parameter and min parameter are set,
+        // we expect the max is derived from boundary.
+        // target 0.5, max 1.0, min 0.3
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 0.5);
+        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 1.);
+        conf.removeConfig(AutoScalerOptions.UTILIZATION_MAX);
+        conf.set(AutoScalerOptions.UTILIZATION_MIN, 0.3);
+
+        metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 80, 81), sink, evaluated(10, 100, 101)),
+                        dummyGlobalMetrics);
+
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .isEmpty();
+
+        metrics =
+                new EvaluatedMetrics(
+                        Map.of(source, evaluated(10, 80, 79), sink, evaluated(10, 100, 101)),
+                        dummyGlobalMetrics);
+        assertThat(
+                        scalingExecutor.computeScalingSummary(
+                                context,
+                                metrics,
+                                Map.of(),
+                                Duration.ZERO,
+                                jobTopology,
+                                new DelayedScaleDown()))
+                .containsOnlyKeys(source, sink);
+    }
+
+    @Test
     public void testVertexesExclusionForScaling() throws Exception {
         var sourceHexString = "0bfd135746ac8efb3cce668b12e16d3a";
         var source = JobVertexID.fromHexString(sourceHexString);
@@ -266,7 +423,7 @@ public class ScalingExecutorTest {
 
         var conf = context.getConfiguration();
         conf.set(AutoScalerOptions.SCALE_DOWN_INTERVAL, Duration.ofSeconds(0));
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION, .8);
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, .8);
         var metrics =
                 new EvaluatedMetrics(
                         Map.of(
@@ -720,7 +877,7 @@ public class ScalingExecutorTest {
                                 null));
 
         var conf = context.getConfiguration();
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION, 1.d);
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 1.d);
 
         // The expected new parallelism is 7 without adjustment by max parallelism.
         var metrics =
@@ -774,8 +931,9 @@ public class ScalingExecutorTest {
         conf.setString("taskmanager.numberOfTaskSlots", "2");
         cpuQuota.ifPresent(v -> conf.set(AutoScalerOptions.CPU_QUOTA, v));
         memoryQuota.ifPresent(v -> conf.set(AutoScalerOptions.MEMORY_QUOTA, MemorySize.parse(v)));
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION, 0.6);
-        conf.set(AutoScalerOptions.TARGET_UTILIZATION_BOUNDARY, 0.);
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 0.6);
+        conf.set(AutoScalerOptions.UTILIZATION_MAX, 0.6);
+        conf.set(AutoScalerOptions.UTILIZATION_MIN, 0.6);
 
         testQuotaReached(slotSharingGroupId1, slotSharingGroupId2, quotaReached, ctx);
     }

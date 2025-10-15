@@ -149,22 +149,37 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
         // Add scaling metrics to history if they were computed successfully
         metricHistory.put(now, scalingMetrics);
 
-        if (isStabilizing) {
-            LOG.info("Stabilizing until {}", readable(stableTime));
-            stateStore.storeCollectedMetrics(ctx, metricHistory);
-            return new CollectedMetricHistory(topology, Collections.emptySortedMap(), jobRunningTs);
-        }
-
         var collectedMetrics = new CollectedMetricHistory(topology, metricHistory, jobRunningTs);
         if (now.isBefore(windowFullTime)) {
-            LOG.info("Metric window not full until {}", readable(windowFullTime));
+            if (isStabilizing) {
+                LOG.info("Stabilizing until {}", readable(stableTime));
+            } else {
+                LOG.info(
+                        "Metric window is not full until {}. {} samples collected so far",
+                        readable(windowFullTime),
+                        metricHistory.size());
+            }
         } else {
             collectedMetrics.setFullyCollected(true);
             // Trim metrics outside the metric window from metrics history
-            metricHistory.headMap(now.minus(metricWindowSize)).clear();
+            var trimBefore = now.minus(metricWindowSize);
+            int numDropped = removeMetricsBefore(trimBefore, metricHistory);
+            LOG.debug(
+                    "Metric window is now full. Dropped {} samples before {}, keeping {}.",
+                    numDropped,
+                    readable(trimBefore),
+                    metricHistory.size());
         }
         stateStore.storeCollectedMetrics(ctx, metricHistory);
         return collectedMetrics;
+    }
+
+    private int removeMetricsBefore(
+            Instant cutOffTimestamp, SortedMap<Instant, CollectedMetrics> metricHistory) {
+        var toBeDropped = metricHistory.headMap(cutOffTimestamp);
+        var numDropped = toBeDropped.size();
+        toBeDropped.clear();
+        return numDropped;
     }
 
     protected abstract Map<FlinkMetric, Metric> queryJmMetrics(Context ctx) throws Exception;
@@ -254,7 +269,7 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
         try (var restClient = ctx.getRestClusterClient()) {
             Pattern partitionRegex =
                     Pattern.compile(
-                            "^.*\\.KafkaSourceReader\\.topic\\.(?<kafkaTopic>.+)\\.partition\\.(?<kafkaId>\\d+)\\.currentOffset$"
+                            "^.*?(\\.kafkaCluster\\.(?<kafkaCluster>.+))?\\.KafkaSourceReader\\.topic\\.(?<kafkaTopic>.+)\\.partition\\.(?<kafkaId>\\d+)\\.currentOffset$"
                                     + "|^.*\\.PulsarConsumer\\.(?<pulsarTopic>.+)-partition-(?<pulsarId>\\d+)\\..*\\.numMsgsReceived$");
             for (var vertexInfo : topology.getVertexInfos().values()) {
                 if (vertexInfo.getInputs().isEmpty()) {
@@ -266,12 +281,18 @@ public abstract class ScalingMetricCollector<KEY, Context extends JobAutoScalerC
                                                 Matcher matcher = partitionRegex.matcher(v);
                                                 if (matcher.matches()) {
                                                     String kafkaTopic = matcher.group("kafkaTopic");
+                                                    String kafkaCluster =
+                                                            matcher.group("kafkaCluster");
                                                     String kafkaId = matcher.group("kafkaId");
                                                     String pulsarTopic =
                                                             matcher.group("pulsarTopic");
                                                     String pulsarId = matcher.group("pulsarId");
                                                     return kafkaTopic != null
-                                                            ? kafkaTopic + "-" + kafkaId
+                                                            ? kafkaCluster
+                                                                    + "-"
+                                                                    + kafkaTopic
+                                                                    + "-"
+                                                                    + kafkaId
                                                             : pulsarTopic + "-" + pulsarId;
                                                 }
                                                 return null;

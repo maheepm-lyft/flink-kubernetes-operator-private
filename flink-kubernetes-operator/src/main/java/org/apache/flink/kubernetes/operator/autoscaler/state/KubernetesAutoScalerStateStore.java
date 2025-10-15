@@ -266,11 +266,6 @@ public class KubernetesAutoScalerStateStore
         configMapStore.flush(jobContext);
     }
 
-    @Override
-    public void removeInfoFromCache(ResourceID resourceID) {
-        configMapStore.removeInfoFromCache(resourceID);
-    }
-
     @SneakyThrows
     protected static String serializeScalingHistory(
             Map<JobVertexID, SortedMap<Instant, ScalingSummary>> scalingHistory) {
@@ -408,4 +403,7 @@ public class KubernetesAutoScalerStateStore
         loaderOptions.setCodePointLimit(20 * 1024 * 1024);
         return YAMLFactory.builder().loaderOptions(loaderOptions).build();
     }
+
+    @Override
+    public void close() throws Exception {}
 }

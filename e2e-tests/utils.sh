@@ -231,8 +231,14 @@ function delete_operator_pod_with_leadership() {
 function debug_and_show_logs {
     echo "Debugging failed e2e test:"
     echo "Currently existing Kubernetes resources"
+    kubectl get flinkdeployments
+    kubectl get flinksessionjobs
     kubectl get all
+    kubectl get configmaps
+    kubectl describe flinkdeployments
+    kubectl describe flinksessionjobs
     kubectl describe all
+    kubectl describe configmaps
 
     operator_pod_namespace=$(get_operator_pod_namespace)
     operator_pod_names=$(get_operator_pod_name)
@@ -298,7 +304,7 @@ function start_minikube_if_not_running {
         echo "Starting minikube ..."
         # Please update tbe docs when changing kubernetes version
         minikube start \
-        --kubernetes-version=v1.25.3 \
+        --kubernetes-version=v1.28.0 \
         --extra-config=kubelet.image-gc-high-threshold=99 \
         --extra-config=kubelet.image-gc-low-threshold=98 \
         --extra-config=kubelet.minimum-container-ttl-duration=120m \

@@ -50,6 +50,7 @@ import org.apache.flink.kubernetes.operator.exception.UpgradeFailureException;
 import org.apache.flink.kubernetes.operator.observer.CheckpointFetchResult;
 import org.apache.flink.kubernetes.operator.observer.SavepointFetchResult;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
+import org.apache.flink.runtime.checkpoint.CheckpointStatsStatus;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.instance.HardwareDescription;
@@ -58,14 +59,18 @@ import org.apache.flink.runtime.rest.RestClient;
 import org.apache.flink.runtime.rest.handler.async.AsynchronousOperationResult;
 import org.apache.flink.runtime.rest.handler.async.TriggerResponse;
 import org.apache.flink.runtime.rest.messages.DashboardConfiguration;
+import org.apache.flink.runtime.rest.messages.JobExceptionsInfoWithHistory;
 import org.apache.flink.runtime.rest.messages.MessageHeaders;
 import org.apache.flink.runtime.rest.messages.MessageParameters;
 import org.apache.flink.runtime.rest.messages.RequestBody;
 import org.apache.flink.runtime.rest.messages.ResponseBody;
 import org.apache.flink.runtime.rest.messages.TriggerId;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointInfo;
+import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointStatistics;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointStatusMessageParameters;
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointTriggerMessageParameters;
+import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatistics;
+import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatisticsHeaders;
 import org.apache.flink.runtime.rest.messages.job.metrics.JobMetricsMessageParameters;
 import org.apache.flink.runtime.rest.messages.job.metrics.Metric;
 import org.apache.flink.runtime.rest.messages.job.metrics.MetricCollectionResponseBody;
@@ -107,6 +112,7 @@ import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.fabric8.kubernetes.client.server.mock.EnableKubernetesMockClient;
 import io.fabric8.kubernetes.client.server.mock.KubernetesMockServer;
+import lombok.SneakyThrows;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -114,6 +120,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.testcontainers.shaded.com.google.common.collect.ImmutableMap;
 
 import java.io.File;
 import java.io.IOException;
@@ -142,6 +149,7 @@ import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConf
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -416,6 +424,52 @@ public class AbstractFlinkServiceTest {
         } else {
             assertTrue(flinkService.deleted.isEmpty());
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    public void savepointErrorTest(boolean deserializable) throws Exception {
+        var testingClusterClient =
+                new TestingClusterClient<>(configuration, TestUtils.TEST_DEPLOYMENT_NAME);
+        var savepointPath = "file:///path/of/svp-1";
+        configuration.set(CheckpointingOptions.SAVEPOINT_DIRECTORY, savepointPath);
+
+        var savepointErr = new SerializedThrowable(new Exception("sp test err"));
+        if (!deserializable) {
+            var cachedException = SerializedThrowable.class.getDeclaredField("cachedException");
+            cachedException.setAccessible(true);
+            cachedException.set(savepointErr, null);
+
+            var bytes = SerializedThrowable.class.getDeclaredField("serializedException");
+            bytes.setAccessible(true);
+            bytes.set(savepointErr, new byte[] {1, 2, 3});
+        }
+
+        testingClusterClient.setStopWithSavepointFunction(
+                (jobID, advanceToEndOfEventTime, savepointDir) -> {
+                    CompletableFuture<String> result = new CompletableFuture<>();
+                    result.completeExceptionally(savepointErr);
+                    return result;
+                });
+
+        var flinkService = new TestingService(testingClusterClient);
+
+        FlinkDeployment deployment = TestUtils.buildApplicationCluster();
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        JobStatus jobStatus = deployment.getStatus().getJobStatus();
+        jobStatus.setJobId(JobID.generate().toHexString());
+        jobStatus.setState(RUNNING);
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
+
+        assertThrows(
+                UpgradeFailureException.class,
+                () ->
+                        flinkService.cancelJob(
+                                deployment,
+                                SuspendMode.SAVEPOINT,
+                                configManager.getObserveConfig(deployment),
+                                true),
+                "sp test err");
     }
 
     @ParameterizedTest
@@ -732,11 +786,14 @@ public class AbstractFlinkServiceTest {
         testingClusterClient.setStopWithSavepointFormat(
                 (id, formatType, savepointDir) -> {
                     if (failAfterSavepointCompletes) {
-                        stopWithSavepointFuture.completeExceptionally(
+                        CompletableFuture<String> result = new CompletableFuture<>();
+                        stopWithSavepointFuture.completeExceptionally(new Exception());
+                        result.completeExceptionally(
                                 new CompletionException(
                                         new SerializedThrowable(
                                                 new StopWithSavepointStoppingException(
                                                         savepointPath, jobID))));
+                        return result;
                     } else {
                         stopWithSavepointFuture.complete(
                                 new Tuple3<>(id, formatType, savepointDir));
@@ -933,10 +990,15 @@ public class AbstractFlinkServiceTest {
 
     @Test
     public void removeOperatorConfigTest() {
-        var key = "kubernetes.operator.meyKey";
-        var deployConfig = Configuration.fromMap(Map.of("kubernetes.operator.meyKey", "v"));
+        var opKey1 = "kubernetes.operator.meyKey";
+        var opKey2 = "job.autoscaler.";
+        var regularKey = "k";
+        var deployConfig =
+                Configuration.fromMap(Map.of(opKey1, "v", opKey2, "v", regularKey, "v1"));
         var newConf = AbstractFlinkService.removeOperatorConfigs(deployConfig);
-        assertFalse(newConf.containsKey(key));
+        assertFalse(newConf.containsKey(opKey1));
+        assertFalse(newConf.containsKey(opKey2));
+        assertTrue(newConf.containsKey(regularKey));
     }
 
     @Test
@@ -988,6 +1050,35 @@ public class AbstractFlinkServiceTest {
                         null);
         var tmsInfo = new TaskManagersInfo(List.of(tmInfo));
 
+        var checkpointingStatistics =
+                new CheckpointingStatistics(
+                        new CheckpointingStatistics.Counts(-1, -1, -1, -1, -1),
+                        new CheckpointingStatistics.Summary(null, null, null, null, null, null),
+                        new CheckpointingStatistics.LatestCheckpoints(
+                                new CheckpointStatistics.CompletedCheckpointStatistics(
+                                        42,
+                                        CheckpointStatsStatus.COMPLETED,
+                                        false,
+                                        null,
+                                        123,
+                                        1234,
+                                        -1,
+                                        42424242,
+                                        -1,
+                                        -1,
+                                        -1,
+                                        -1,
+                                        0,
+                                        0,
+                                        CheckpointStatistics.RestAPICheckpointType.CHECKPOINT,
+                                        Map.of(),
+                                        "path",
+                                        false),
+                                null,
+                                null,
+                                null),
+                        List.of());
+
         var flinkService =
                 getTestingService(
                         (h, p, r) -> {
@@ -995,6 +1086,8 @@ public class AbstractFlinkServiceTest {
                                 return CompletableFuture.completedFuture(config);
                             } else if (h instanceof TaskManagersHeaders) {
                                 return CompletableFuture.completedFuture(tmsInfo);
+                            } else if (h instanceof CheckpointingStatisticsHeaders) {
+                                return CompletableFuture.completedFuture(checkpointingStatistics);
                             }
                             fail("unknown request");
                             return null;
@@ -1004,7 +1097,7 @@ public class AbstractFlinkServiceTest {
         conf.set(JobManagerOptions.TOTAL_PROCESS_MEMORY, MemorySize.ofMebiBytes(1000));
         conf.set(TaskManagerOptions.TOTAL_PROCESS_MEMORY, MemorySize.ofMebiBytes(1000));
 
-        assertEquals(
+        Map<String, String> expectedEntries =
                 Map.of(
                         DashboardConfiguration.FIELD_NAME_FLINK_VERSION,
                         testVersion,
@@ -1013,8 +1106,16 @@ public class AbstractFlinkServiceTest {
                         AbstractFlinkService.FIELD_NAME_TOTAL_CPU,
                         "2.0",
                         AbstractFlinkService.FIELD_NAME_TOTAL_MEMORY,
-                        "" + MemorySize.ofMebiBytes(1000).getBytes() * 2),
-                flinkService.getClusterInfo(conf));
+                        "" + MemorySize.ofMebiBytes(1000).getBytes() * 2);
+
+        assertEquals(expectedEntries, flinkService.getClusterInfo(conf, null));
+
+        assertEquals(
+                ImmutableMap.<String, String>builder()
+                        .putAll(expectedEntries)
+                        .put(AbstractFlinkService.FIELD_NAME_STATE_SIZE, "42424242")
+                        .build(),
+                flinkService.getClusterInfo(conf, JobID.generate().toHexString()));
     }
 
     @Test
@@ -1215,6 +1316,51 @@ public class AbstractFlinkServiceTest {
 
         assertTrue(remaining.toMillis() > 0);
         assertTrue(remaining.toMillis() < 1000);
+    }
+
+    @Test
+    public void listingJobExceptionsIsCompatibleWihFlinkV1_17Test() throws Exception {
+        var flinkV117JsonResponse =
+                "{\n"
+                        + "  \"root-exception\": \"org.apache.flink.util.FlinkExpectedException: The TaskExecutor is shutting down.\\n\\tat org.apache.flink.runtime.taskexecutor.TaskExecutor.onStop(TaskExecutor.java:476)\\n\\tat org.apache.flink.runtime.rpc.RpcEndpoint.internalCallOnStop(RpcEndpoint.java:239)\\n\\tat org.apache.flink.runtime.rpc.akka.AkkaRpcActor$StartedState.lambda$terminate$0(AkkaRpcActor.java:578)\\n\\tat org.apache.flink.runtime.concurrent.akka.ClassLoadingUtils.runWithContextClassLoader(ClassLoadingUtils.java:83)\\n\\tat org.apache.flink.runtime.rpc.akka.AkkaRpcActor$StartedState.terminate(AkkaRpcActor.java:577)\\n\\tat org.apache.flink.runtime.rpc.akka.AkkaRpcActor.handleControlMessage(AkkaRpcActor.java:196)\\n\\tat akka.japi.pf.UnitCaseStatement.apply(CaseStatements.scala:24)\\n\\tat akka.japi.pf.UnitCaseStatement.apply(CaseStatements.scala:20)\\n\\tat scala.PartialFunction.applyOrElse(PartialFunction.scala:127)\\n\\tat scala.PartialFunction.applyOrElse$(PartialFunction.scala:126)\\n\\tat akka.japi.pf.UnitCaseStatement.applyOrElse(CaseStatements.scala:20)\\n\\tat scala.PartialFunction$OrElse.applyOrElse(PartialFunction.scala:175)\\n\\tat scala.PartialFunction$OrElse.applyOrElse(PartialFunction.scala:176)\\n\\tat akka.actor.Actor.aroundReceive(Actor.scala:537)\\n\\tat akka.actor.Actor.aroundReceive$(Actor.scala:535)\\n\\tat akka.actor.AbstractActor.aroundReceive(AbstractActor.scala:220)\\n\\tat akka.actor.ActorCell.receiveMessage(ActorCell.scala:579)\\n\\tat akka.actor.ActorCell.invoke(ActorCell.scala:547)\\n\\tat akka.dispatch.Mailbox.processMailbox(Mailbox.scala:270)\\n\\tat akka.dispatch.Mailbox.run(Mailbox.scala:231)\\n\\tat akka.dispatch.Mailbox.exec(Mailbox.scala:243)\\n\\tat java.base/java.util.concurrent.ForkJoinTask.doExec(Unknown Source)\\n\\tat java.base/java.util.concurrent.ForkJoinPool$WorkQueue.topLevelExec(Unknown Source)\\n\\tat java.base/java.util.concurrent.ForkJoinPool.scan(Unknown Source)\\n\\tat java.base/java.util.concurrent.ForkJoinPool.runWorker(Unknown Source)\\n\\tat java.base/java.util.concurrent.ForkJoinWorkerThread.run(Unknown Source)\\n\",\n"
+                        + "  \"timestamp\": 1755995361447,\n"
+                        + "  \"all-exceptions\": [],\n"
+                        + "  \"truncated\": false,\n"
+                        + "  \"exceptionHistory\": {\n"
+                        + "    \"entries\": [\n"
+                        + "      {\n"
+                        + "        \"exceptionName\": \"org.apache.flink.util.FlinkExpectedException\",\n"
+                        + "        \"stacktrace\": \"org.apache.flink.util.FlinkExpectedException: The TaskExecutor is shutting down.\\n\\tat org.apache.flink.runtime.taskexecutor.TaskExecutor.onStop(TaskExecutor.java:476)\\n\\tat org.apache.flink.runtime.rpc.RpcEndpoint.internalCallOnStop(RpcEndpoint.java:239)\\n\\tat org.apache.flink.runtime.rpc.akka.AkkaRpcActor$StartedState.lambda$terminate$0(AkkaRpcActor.java:578)\\n\\tat org.apache.flink.runtime.concurrent.akka.ClassLoadingUtils.runWithContextClassLoader(ClassLoadingUtils.java:83)\\n\\tat org.apache.flink.runtime.rpc.akka.AkkaRpcActor$StartedState.terminate(AkkaRpcActor.java:577)\\n\\tat org.apache.flink.runtime.rpc.akka.AkkaRpcActor.handleControlMessage(AkkaRpcActor.java:196)\\n\\tat akka.japi.pf.UnitCaseStatement.apply(CaseStatements.scala:24)\\n\\tat akka.japi.pf.UnitCaseStatement.apply(CaseStatements.scala:20)\\n\\tat scala.PartialFunction.applyOrElse(PartialFunction.scala:127)\\n\\tat scala.PartialFunction.applyOrElse$(PartialFunction.scala:126)\\n\\tat akka.japi.pf.UnitCaseStatement.applyOrElse(CaseStatements.scala:20)\\n\\tat scala.PartialFunction$OrElse.applyOrElse(PartialFunction.scala:175)\\n\\tat scala.PartialFunction$OrElse.applyOrElse(PartialFunction.scala:176)\\n\\tat akka.actor.Actor.aroundReceive(Actor.scala:537)\\n\\tat akka.actor.Actor.aroundReceive$(Actor.scala:535)\\n\\tat akka.actor.AbstractActor.aroundReceive(AbstractActor.scala:220)\\n\\tat akka.actor.ActorCell.receiveMessage(ActorCell.scala:579)\\n\\tat akka.actor.ActorCell.invoke(ActorCell.scala:547)\\n\\tat akka.dispatch.Mailbox.processMailbox(Mailbox.scala:270)\\n\\tat akka.dispatch.Mailbox.run(Mailbox.scala:231)\\n\\tat akka.dispatch.Mailbox.exec(Mailbox.scala:243)\\n\\tat java.base/java.util.concurrent.ForkJoinTask.doExec(Unknown Source)\\n\\tat java.base/java.util.concurrent.ForkJoinPool$WorkQueue.topLevelExec(Unknown Source)\\n\\tat java.base/java.util.concurrent.ForkJoinPool.scan(Unknown Source)\\n\\tat java.base/java.util.concurrent.ForkJoinPool.runWorker(Unknown Source)\\n\\tat java.base/java.util.concurrent.ForkJoinWorkerThread.run(Unknown Source)\\n\",\n"
+                        + "        \"timestamp\": 1755995361447,\n"
+                        + "        \"taskName\": \"Source: Custom Source (2/2) - execution #0\",\n"
+                        + "        \"location\": \"10.244.0.93:37079\",\n"
+                        + "        \"taskManagerId\": \"basic-example-taskmanager-1-1\",\n"
+                        + "        \"concurrentExceptions\": []\n"
+                        + "      }\n"
+                        + "    ],\n"
+                        + "    \"truncated\": false\n"
+                        + "  }\n"
+                        + "}";
+        var flinkService =
+                getTestingService(
+                        (messageHeaders, messageParameters, requestBody) ->
+                                CompletableFuture.completedFuture(
+                                        parseExceptionsJsonResponse(flinkV117JsonResponse)));
+
+        var jobExceptions =
+                flinkService.getJobExceptions(
+                        TestUtils.buildApplicationCluster(), new JobID(), new Configuration());
+        assertNotNull(jobExceptions);
+        assertEquals(1, jobExceptions.getExceptionHistory().getEntries().size());
+    }
+
+    @SneakyThrows
+    private static JobExceptionsInfoWithHistory parseExceptionsJsonResponse(
+            String flinkV117JsonResponse) {
+        var jsonNode = RestMapperUtils.getStrictObjectMapper().readTree(flinkV117JsonResponse);
+        var jsonParser = RestMapperUtils.getStrictObjectMapper().treeAsTokens(jsonNode);
+        return RestMapperUtils.getFlexibleObjectMapper()
+                .readValue(jsonParser, JobExceptionsInfoWithHistory.class);
     }
 
     class TestingService extends AbstractFlinkService {
